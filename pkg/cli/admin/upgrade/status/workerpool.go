@@ -153,7 +153,7 @@ func assessNodesStatus(cv *configv1.ClusterVersion, pool mcfgv1.MachineConfigPoo
 		currentVersion, foundCurrent := getOpenShiftVersionOfMachineConfig(machineConfigs, node.Annotations[mco.CurrentMachineConfigAnnotationKey])
 		desiredVersion, foundDesired := getOpenShiftVersionOfMachineConfig(machineConfigs, node.Annotations[mco.DesiredMachineConfigAnnotationKey])
 
-		isUnavailable, reasonOfUnavailability := isNodeUnavailable(node, pool)
+		isUnavailable, reasonOfUnavailability, descriptionOfUnavailability := isNodeUnavailable(node, pool)
 		isDegraded := isNodeDegraded(node)
 		isUpdated := foundCurrent && isLatestUpdateHistoryVersionEqualTo(cv.Status.History, currentVersion)
 
@@ -205,9 +205,14 @@ func assessNodesStatus(cv *configv1.ClusterVersion, pool mcfgv1.MachineConfigPoo
 			}
 		}
 
+		description := descriptionOfUnavailability
+		if description == "" {
+			description = message
+		}
+
 		// For those cases we show assessment only (Unavailable) and omit the insight.
-		if message != mco.ReasonOfUnavailabilityMCDWorkInProgress && message != mco.ReasonOfUnavailabilityNodeUnschedulable {
-			insights = append(insights, nodeInsights(pool, node, message, isUnavailable, isUpdating, isDegraded)...)
+		if generateInsight(message, description) {
+			insights = append(insights, nodeInsights(pool, node, description, isUnavailable, isUpdating, isDegraded)...)
 		}
 
 		nodesStatusData = append(nodesStatusData, nodeDisplayData{
@@ -235,6 +240,17 @@ func assessNodesStatus(cv *configv1.ClusterVersion, pool mcfgv1.MachineConfigPoo
 	})
 
 	return nodesStatusData, insights
+}
+
+func generateInsight(message string, description string) bool {
+	if message == mco.ReasonOfUnavailabilityMCDWorkInProgress || message == mco.ReasonOfUnavailabilityNodeUnschedulable {
+		return false
+	}
+	if message == mco.ReasonOfUnavailabilityNodeNotReady || message == mco.ReasonOfUnavailabilityNodeDiskPressure ||
+		message == mco.ReasonOfUnavailabilityNodeNetworkUnavailable {
+		return description != ""
+	}
+	return true
 }
 
 func getOpenShiftVersionOfMachineConfig(machineConfigs []mcfgv1.MachineConfig, name string) (string, bool) {
@@ -278,9 +294,26 @@ func isLatestUpdateHistoryVersionEqualTo(history []configv1.UpdateHistory, versi
 	return false
 }
 
-func isNodeUnavailable(node corev1.Node, pool mcfgv1.MachineConfigPool) (bool, string) {
+func isNodeUnavailable(node corev1.Node, pool mcfgv1.MachineConfigPool) (bool, []mco.BadCondition) {
 	lns := mco.NewLayeredNodeState(&node)
-	return lns.IsUnavailable(&pool), lns.ReasonOfUnavailability
+	return lns.IsUnavailable(&pool), lns.Unavailable
+}
+
+func getDescription(lns *mco.LayeredNodeState) string {
+	now := time.Now()
+	if lns.ReasonOfUnavailability == mco.ReasonOfUnavailabilityNodeNotReady && now.Sub(lns.LastTransitionTimeOfUnavailability) > time.Minute*5 {
+		return fmt.Sprintf("%s since %s with message %q", lns.ReasonOfUnavailability,
+			lns.LastTransitionTimeOfUnavailability.UTC().Format(time.RFC3339), lns.MessageOfUnavailability)
+	}
+	if lns.ReasonOfUnavailability == mco.ReasonOfUnavailabilityNodeDiskPressure {
+		return fmt.Sprintf("%s since %s with message %q", lns.ReasonOfUnavailability,
+			lns.LastTransitionTimeOfUnavailability.UTC().Format(time.RFC3339), lns.MessageOfUnavailability)
+	}
+	if lns.ReasonOfUnavailability == mco.ReasonOfUnavailabilityNodeNotReady {
+		return fmt.Sprintf("%s since %s with message %q", lns.ReasonOfUnavailability,
+			lns.LastTransitionTimeOfUnavailability.UTC().Format(time.RFC3339), lns.MessageOfUnavailability)
+	}
+	return ""
 }
 
 func isNodeDegraded(node corev1.Node) bool {
