@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	configv1 "github.com/openshift/api/config/v1"
 	"io"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"os"
 	"path"
 	"path/filepath"
@@ -350,16 +352,20 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 	}
 
 	tarEntryCallbacks := []extract.TarEntryFunc{}
+	manifestFiles := map[string][]manifest.Manifest{}
+	var extractManifestsAndIncludedWithClusterCapabilities bool
+	enabledCaps := sets.New[configv1.ClusterVersionCapability]()
+	var inclusionConfig manifestInclusionConfiguration
+	include := func(m *manifest.Manifest) error { return nil } // default to including everything
+	expectedProviderSpecKind := credRequestCloudProviderSpecKindMapping[o.Cloud]
 
 	var manifestErrs []error
 	if o.ExtractManifests {
-		expectedProviderSpecKind := credRequestCloudProviderSpecKindMapping[o.Cloud]
 
-		include := func(m *manifest.Manifest) error { return nil } // default to including everything
 		if o.Included {
 			context := "connected cluster"
-			inclusionConfig := manifestInclusionConfiguration{}
 			if o.InstallConfig == "" {
+				extractManifestsAndIncludedWithClusterCapabilities = true
 				inclusionConfig, err = findClusterIncludeConfig(ctx, o.RESTConfig)
 			} else {
 				inclusionConfig, err = findClusterIncludeConfigFromInstallConfig(ctx, o.InstallConfig)
@@ -434,6 +440,22 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 				return true, nil
 			}
 
+			manifestFiles[hdr.Name] = make([]manifest.Manifest, len(ms))
+			for i, m := range ms {
+				manifestFiles[hdr.Name][i] = m
+				if !extractManifestsAndIncludedWithClusterCapabilities {
+					continue
+				}
+				currentPayload := getCurrentPayload()
+				if currentPayload == nil {
+					continue
+				}
+				v, ok := currentPayload[getResourceID(m)]
+				if ok {
+					enabledCaps.Insert(v.GetManifestCapabilities()...).Insert(m.GetManifestCapabilities()...)
+				}
+			}
+
 			for i := len(ms) - 1; i >= 0; i-- {
 				if o.Included && o.CredentialsRequests && ms[i].GVK == credentialsRequestGVK && len(ms[i].Obj.GetAnnotations()) == 0 {
 					klog.V(4).Infof("Including %s for manual CredentialsRequests, despite lack of annotations", ms[i].String())
@@ -464,7 +486,7 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 				manifestsToWrite = append(manifestsToWrite, m)
 			}
 
-			if len(manifestsToWrite) == 0 {
+			if extractManifestsAndIncludedWithClusterCapabilities || len(manifestsToWrite) == 0 {
 				return true, nil
 			}
 
@@ -531,6 +553,10 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 		return err
 	}
 
+	if extractManifestsAndIncludedWithClusterCapabilities {
+		manifestErrs = append(manifestErrs, aaa(manifestFiles, include, o.Manifests, o.Included, o.CredentialsRequests, expectedProviderSpecKind, o.Directory, o.Out)...)
+	}
+
 	if metadataVerifyMsg != "" {
 		if o.File == "" && o.Out != nil {
 			fmt.Fprintf(o.Out, "%s\n", metadataVerifyMsg)
@@ -559,6 +585,22 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 
 	return nil
 
+}
+
+func getResourceID(m manifest.Manifest) string {
+	ns := m.Obj.GetNamespace()
+	name := m.Obj.GetName()
+	group := m.GVK.Group
+	kind := m.GVK.Kind
+	if ns == "" {
+		return fmt.Sprintf("Group: %q Kind: %q Name: %q", group, kind, name)
+	} else {
+		return fmt.Sprintf("Group: %q Kind: %q Namespace: %q Name: %q", group, kind, ns, name)
+	}
+}
+
+func getCurrentPayloadManifests() []manifest.Manifest {
+	return nil
 }
 
 func (o *ExtractOptions) extractGit(dir string) error {

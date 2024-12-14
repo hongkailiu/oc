@@ -10,8 +10,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/pkg/errors"
 	"hash"
 	"io"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1235,10 +1237,9 @@ func findClusterIncludeConfig(ctx context.Context, restConfig *rest.Config) (man
 		return config, err
 	} else {
 		config.Overrides = clusterVersion.Spec.Overrides
-		config.Capabilities = &clusterVersion.Status.Capabilities
+		clusterVersionCapabilitiesStatus := clusterVersion.Status.Capabilities.DeepCopy()
+		config.Capabilities = clusterVersionCapabilitiesStatus
 
-		// The set of the capabilities defined in configv1.ClusterVersionCapabilitySets may grow over time.
-		// Here we refresh "known" and "enabled" from lib so the new capabilities are included.
 		known := sets.New[configv1.ClusterVersionCapability]()
 		for _, s := range configv1.ClusterVersionCapabilitySets {
 			known.Insert(s...)
@@ -1283,7 +1284,74 @@ func findClusterIncludeConfig(ctx context.Context, restConfig *rest.Config) (man
 
 func newIncluder(config manifestInclusionConfiguration) includer {
 	return func(m *manifest.Manifest) error {
-		config.Capabilities.EnabledCapabilities = sets.New[configv1.ClusterVersionCapability](config.Capabilities.EnabledCapabilities...).Insert(m.GetManifestCapabilities()...).UnsortedList()
 		return m.Include(config.ExcludeIdentifier, config.RequiredFeatureSet, config.Profile, config.Capabilities, config.Overrides)
 	}
+}
+
+// TODO
+func getCurrentPayload(cv *configv1.ClusterVersion, []manifest.Manifest, includer includer) map[string]manifest.Manifest {
+	return nil
+}
+
+// TODO rename the function
+func aaa(updatePayload map[string][]manifest.Manifest, includer includer, manifests []manifest.Manifest, included, credentialsRequests bool, expectedProviderSpecKind, directory string, out io.Writer) []error {
+	var errs []error
+	for hdrName, ms := range updatePayload {
+		for i := len(ms) - 1; i >= 0; i-- {
+			if included && credentialsRequests && ms[i].GVK == credentialsRequestGVK && len(ms[i].Obj.GetAnnotations()) == 0 {
+				klog.V(4).Infof("Including %s for manual CredentialsRequests, despite lack of annotations", ms[i].String())
+			} else if err := includer(&ms[i]); err != nil {
+				klog.V(4).Infof("Excluding %s: %s", ms[i].String(), err)
+				ms = append(ms[:i], ms[i+1:]...)
+			}
+		}
+		manifests = append(manifests, ms...)
+		manifestsToWrite := make([]manifest.Manifest, 0, len(ms))
+		for _, m := range ms {
+			if credentialsRequests {
+				if m.GVK != credentialsRequestGVK {
+					continue
+				}
+				if expectedProviderSpecKind != "" {
+					kind, _, err := unstructured.NestedString(m.Obj.Object, "spec", "providerSpec", "kind")
+					if err != nil {
+						errs = append(errs, errors.Wrap(err, "error extracting cred request kind"))
+						continue
+					}
+					if kind != expectedProviderSpecKind {
+						continue
+					}
+				}
+			}
+			manifestsToWrite = append(manifestsToWrite, m)
+		}
+
+		if len(manifestsToWrite) == 0 {
+			continue
+		}
+
+		if directory != "" {
+			fileOut, err := os.Create(filepath.Join(directory, hdrName))
+			if err != nil {
+				errs = append(errs, errors.Wrapf(err, "error creating manifest in %s", hdrName))
+				continue
+			}
+			out = fileOut
+		}
+		if out != nil {
+			for _, m := range manifestsToWrite {
+				yamlBytes, err := yaml.JSONToYAML(m.Raw)
+				if err != nil {
+					errs = append(errs, errors.Wrapf(err, "error serializing manifest in %s", hdrName))
+					continue
+				}
+				fmt.Fprintf(out, "---\n")
+				if _, err := out.Write(yamlBytes); err != nil {
+					errs = append(errs, errors.Wrapf(err, "error writing manifest in %s", hdrName))
+					continue
+				}
+			}
+		}
+	}
+	return errs
 }
