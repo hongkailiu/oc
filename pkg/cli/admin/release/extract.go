@@ -504,28 +504,11 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 	}
 
 	if len(tarEntryCallbacks) > 0 {
-		tarEntryCallbacksDone := make([]bool, len(tarEntryCallbacks))
-		opts.TarEntryCallback = func(hdr *tar.Header, layer extract.LayerInfo, r io.Reader) (bool, error) {
-			for i, callback := range tarEntryCallbacks {
-				if tarEntryCallbacksDone[i] {
-					continue
-				}
-				if cont, err := callback(hdr, layer, r); err != nil {
-					return cont, err
-				} else if !cont {
-					tarEntryCallbacksDone[i] = true
-				}
-			}
-
-			for _, done := range tarEntryCallbacksDone {
-				if !done {
-					return true, nil // still some callbacks that want to keep working
-				}
-			}
-
-			return false, nil
-		}
+		merger := TarEntryCallbackMerger{tarEntryCallbacks: tarEntryCallbacks, tarEntryCallbacksDone: make([]bool, len(tarEntryCallbacks))}
+		opts.TarEntryCallback = merger.handleTarEntry
 	}
+
+	opts.TarEntryCallback = mergeTarEntryCallbacks(tarEntryCallbacks)
 
 	if err := opts.Run(); err != nil {
 		return err
@@ -559,6 +542,41 @@ func (o *ExtractOptions) Run(ctx context.Context) error {
 
 	return nil
 
+}
+
+// mergeTarEntryCallbacks merges a serial of callbacks of type extract.TarEntryFunc into one
+// in a way that it will invoke them one after another until
+// * all of them has been done, or
+// * one of them raises an error, or
+// * one of them decides not to continue.
+// It returns the callback if there is only one callback is provided.
+// It returns nil if no callbacks are provided.
+func mergeTarEntryCallbacks(callbacks []extract.TarEntryFunc) extract.TarEntryFunc {
+	if len(callbacks) == 0 {
+		return nil
+	}
+	if len(callbacks) == 1 {
+		return callbacks[0]
+	}
+	callbacksDone := make([]bool, len(callbacks))
+	return func(hdr *tar.Header, layer extract.LayerInfo, r io.Reader) (bool, error) {
+		for i, callback := range callbacks {
+			if callbacksDone[i] {
+				continue
+			}
+			if cont, err := callback(hdr, layer, r); err != nil {
+				return cont, err
+			} else if !cont {
+				callbacksDone[i] = true
+			}
+		}
+		for _, done := range callbacksDone {
+			if !done {
+				return true, nil // still some callbacks that want to keep working
+			}
+		}
+		return false, nil
+	}
 }
 
 func (o *ExtractOptions) extractGit(dir string) error {
